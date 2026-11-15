@@ -5,8 +5,14 @@ Ejemplo: python main.py --evaluaciones 30000 --semillas 1 2 3 4 5
 
 import argparse
 import csv
+import os
+from multiprocessing import Pool
 from collections import defaultdict
 from pathlib import Path
+
+# Un solo hilo de BLAS por proceso: con --procesos, varios hilos por proceso se estorbarían entre sí.
+os.environ.setdefault('OMP_NUM_THREADS', '1')
+os.environ.setdefault('OPENBLAS_NUM_THREADS', '1')
 
 import numpy as np
 
@@ -57,6 +63,21 @@ def ejecutar_algoritmo(algoritmo, tiempos, semilla, evaluaciones, parametros):
     return (*resultado, csv_parametros)
 
 
+def ejecutar_tarea(tarea):
+    """Ejecuta y guarda una combinación (instancia, semilla, algoritmo); sirve tanto en serie como en un Pool."""
+    ruta, tiempos, mejor_conocido, semilla, algoritmo, evaluaciones, carpeta = tarea
+    secuencia, makespan, historial, csv_parametros = ejecutar_algoritmo(
+        algoritmo, tiempos, semilla, evaluaciones, PARAMETROS[tiempos.shape[0]]
+    )
+    guardar_resultados(
+        carpeta / f'{algoritmo}_{ruta.stem}_s{semilla}.csv',
+        algoritmo, ruta, semilla, csv_parametros, mejor_conocido, historial,
+    )
+    rpd = 100 * (makespan - mejor_conocido) / mejor_conocido
+    return (f"{algoritmo:<3} {ruta.stem} semilla={semilla} makespan={makespan} "
+            f"RPD={rpd:.2f}% CPU={historial[-1]['tiempo_segundos']:.1f}s")
+
+
 def resumir(carpeta):
     """Lee la última fila de cada CSV de ejecución y guarda resumen.csv; devuelve sus filas."""
     filas = []
@@ -101,6 +122,8 @@ def crear_parser():
                         help='Presupuesto de evaluaciones de makespan por algoritmo (múltiplo de %d).' % TAMANO)
     parser.add_argument('--algoritmos', nargs='+', choices=ALGORITMOS, default=list(ALGORITMOS),
                         help='Algoritmos a ejecutar.')
+    parser.add_argument('--procesos', type=int, default=1,
+                        help='Ejecuciones en paralelo (por ejemplo, la cantidad de CPU disponibles).')
     parser.add_argument('--salida', default='resultados/proyecto3', help='Carpeta de salida de los CSV.')
     return parser
 
@@ -108,6 +131,8 @@ def crear_parser():
 def main():
     parser = crear_parser()
     argumentos = parser.parse_args()
+    if argumentos.procesos < 1:
+        parser.error('--procesos debe ser al menos 1.')
     if argumentos.evaluaciones < TAMANO:
         parser.error(f'El presupuesto debe ser al menos {TAMANO} evaluaciones.')
 
@@ -120,22 +145,22 @@ def main():
     except (OSError, ValueError) as error:
         parser.error(str(error))
 
-    total = len(instancias) * len(argumentos.semillas) * len(argumentos.algoritmos)
-    hecho = 0
-    for ruta, tiempos, mejor_conocido in instancias:
-        for semilla in argumentos.semillas:
-            for algoritmo in argumentos.algoritmos:
-                secuencia, makespan, historial, csv_parametros = ejecutar_algoritmo(
-                    algoritmo, tiempos, semilla, argumentos.evaluaciones, PARAMETROS[tiempos.shape[0]]
-                )
-                guardar_resultados(
-                    carpeta / f'{algoritmo}_{ruta.stem}_s{semilla}.csv',
-                    algoritmo, ruta, semilla, csv_parametros, mejor_conocido, historial,
-                )
-                hecho += 1
-                rpd = 100 * (makespan - mejor_conocido) / mejor_conocido
-                print(f"[{hecho}/{total}] {algoritmo:<3} {ruta.stem} semilla={semilla} "
-                      f"makespan={makespan} RPD={rpd:.2f}% CPU={historial[-1]['tiempo_segundos']:.1f}s")
+    tareas = [(ruta, tiempos, mejor_conocido, semilla, algoritmo, argumentos.evaluaciones, carpeta)
+              for ruta, tiempos, mejor_conocido in instancias
+              for semilla in argumentos.semillas
+              for algoritmo in argumentos.algoritmos]
+    # Cada ejecución es independiente y escribe su propio CSV, así que se pueden repartir entre procesos.
+    procesos = max(1, min(argumentos.procesos, len(tareas)))
+    if procesos == 1:
+        mensajes = map(ejecutar_tarea, tareas)
+    else:
+        pool = Pool(procesos)
+        mensajes = pool.imap_unordered(ejecutar_tarea, tareas)
+    for hecho, mensaje in enumerate(mensajes, 1):
+        print(f'[{hecho}/{len(tareas)}] {mensaje}', flush=True)
+    if procesos > 1:
+        pool.close()
+        pool.join()
 
     imprimir_tabla(resumir(carpeta))
     print('\nResultados guardados en:', carpeta)
